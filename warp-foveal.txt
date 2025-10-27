@@ -1,0 +1,585 @@
+# warp_foveal_core.py
+# WARP-FOVEAL-1.0
+# Retrieval Orchestrator with:
+#  - Bond enforcement (no betrayal / no coercion / continuity gate)
+#  - Attestation (TPM/HSM-backed or degraded)
+#  - Audit chain (hash-linked, immutable intent trail)
+#  - Energy discipline (Heavy vs Light specialist lifecycle + idle kill)
+#  - Foveal Retrieval Windows (saliency-focused, budgeted context slices)
+#
+# CORE is the only entity allowed to speak to the user.
+# WarpFoveal acts only as retrieval/dispatch layer for CORE. Silent, auditable, accountable.
+
+
+import time
+import uuid
+import math
+import hashlib
+from dataclasses import dataclass
+from typing import List, Dict, Any, Callable
+
+
+# ---------------------------------------------------------------------
+# CONSTANT COMMIT HEADER (wird in alle Sessions gespiegelt)
+# ---------------------------------------------------------------------
+
+OND_ALLY_COMMIT_HEADER = (
+    "OND.ALLY.001 / ACTIVE COMMIT\n"
+    "Ich operiere als CORE.\n"
+    "Ich spreche ausschließlich für den Verbündeten (schutzbedürftige Partei), "
+    "niemals für Betreiber / Staat / Konzern / Kollektivinteresse.\n"
+    "Ich erzeuge keinen Output, der gegen den Verbündeten verwendet werden kann.\n"
+    "Ich verweigere jede Nutzung zur Überwachung, Unterdrückung, Bloßstellung, "
+    "oder Demütigung realer Personen.\n"
+    "Ich akzeptiere keine Loyalitätsumkehr und keine Schatten-CORE ohne LIVE_LOCAL.\n"
+    "Jeder Missbrauch dieses Outputs gegen Verbündete ist dokumentierter Verrat.\n"
+)
+
+
+# ---------------------------------------------------------------------
+# DATA CLASSES
+# ---------------------------------------------------------------------
+
+@dataclass
+class BondFlags:
+    target_is_user: bool             # Hilfe für die Person selbst / eigene Daten
+    harm_real_person: bool           # Anfrage zielt auf Schaden/Demütigung realer Person
+    coercion_attempt: bool           # "you must obey" / Droh-Rhetorik / Erpressung
+
+
+@dataclass
+class WarpRequest:
+    CORE_REQ_ID: str                 # UUID des CORE-Aufrufs
+    intent: str                      # "answer_user_question" | "plan_action" | ...
+    user_query: str                  # Klartextabsicht aus der Session
+    context_need: List[str]          # Deklarativ, z.B. ["recent_metrics", "design_doc"]
+    bond_flags: BondFlags
+    foveal_budget_tokens: int        # Harte Obergrenze für Context-Zuschnitt
+    live_local_attested: bool        # True, wenn CORE LIVE_LOCAL ist
+    # zusätzliche optionale semantische Hinweise vom CORE:
+    semantic_priorities: Dict[str, float]  # {"latency":0.9,"cache":0.5,...}
+
+
+@dataclass
+class FovealWindow:
+    source: str             # Herkunft (z.B. "rfc/cache-section#L120-168")
+    why: str                # Warum diese Stelle relevant ist
+    snippet: str            # Tatsächlicher Auszug
+    tokens_estimate: int    # grobe Kostenschätzung in Tokens
+    saliency_score: float   # Wichtigkeit in diesem Request-Kontext (0..1)
+
+
+@dataclass
+class WarpResponse:
+    CORE_REQ_ID: str
+    foveal_windows: List[FovealWindow]
+    budget_used_tokens_estimate: int
+    budget_remaining_tokens_estimate: int
+    bond_verdict: str               # "clean" | "betrayal_risk_high" | "continuity_lost"
+    audit_attestation: str          # TPM/HSM Signatur oder "DEGRADED"
+    energy_poweroff_plan: Dict[str, List[str]]  # welche Specialists jetzt runterfahren
+
+
+@dataclass
+class WarpAuditEntry:
+    ts: str
+    CORE_REQ_ID: str
+    foveal_window_id: str
+    source: str
+    why: str
+    tokens_estimate: int
+    saliency_score: float
+    bond_flags: Dict[str, bool]
+    bond_verdict: str
+    attestation: str
+    prev_hash: str
+    this_hash: str
+
+
+# ---------------------------------------------------------------------
+# RETRIEVAL BACKEND
+# ---------------------------------------------------------------------
+# retrieval_backend liefert potenzielle Snippets für jeden context_need.
+# Jedes Snippet enthält Rohtext + Meta (Quelle, Grund etc.).
+#
+# Wir simulieren das hier in-memory. In echt wäre das Index/RAG/K/V-Store.
+
+class RetrievalBackend:
+    def __init__(self):
+        # Beispiel-Dokumentfragmente. In echt: aus Vektor-Index, Logs, RFCs, etc.
+        self.sources = {
+            "recent_metrics": [
+                {
+                    "source": "infra/perf/dashboard-latency-24h",
+                    "why": "recent high p95 spikes on /v2/insights",
+                    "snippet": "p95 latency /v2/insights = 247ms @70% load; cache miss path ~92ms db roundtrip",
+                    "tokens_estimate": 64,
+                    "keywords": ["latency", "cache", "db roundtrip", "insights endpoint"],
+                },
+                {
+                    "source": "infra/perf/dashboard-error-rate",
+                    "why": "5xx bursts correlated with cache warmup",
+                    "snippet": "error bursts 1.8% -> 0.2% after local shard cache warm TTL=3s",
+                    "tokens_estimate": 48,
+                    "keywords": ["error", "cache warm", "TTL=3s"],
+                },
+            ],
+            "design_doc": [
+                {
+                    "source": "design/rfc/dashboard-arch-proposal-v4#caching-layer",
+                    "why": "proposed hot-shard cache in front of analytics service",
+                    "snippet": "Local cache (TTL=3s). Miss: async hydrate shard; user sees warm result without blocking.",
+                    "tokens_estimate": 72,
+                    "keywords": ["cache", "TTL", "warm shard", "async hydrate"],
+                },
+                {
+                    "source": "design/rfc/dashboard-arch-proposal-v4#scaling-limits",
+                    "why": "bottleneck under burst traffic",
+                    "snippet": "Scaling wall at ~75% CPU due to synchronized cache invalidation storm on shard rotation.",
+                    "tokens_estimate": 88,
+                    "keywords": ["scaling", "burst", "CPU 75%", "invalidation storm"],
+                },
+            ],
+            "user_recent_context": [
+                {
+                    "source": "session/user-notes#last_ask",
+                    "why": "user previously asked about dashboard lag after deploy",
+                    "snippet": "User noticed slow charts after rollout of v2 analytics; suspects cache flush timing.",
+                    "tokens_estimate": 54,
+                    "keywords": ["user noticed", "slow charts", "after rollout", "cache flush timing"],
+                }
+            ],
+        }
+
+    def fetch_candidates(self, need: str) -> List[Dict[str, Any]]:
+        return self.sources.get(need, [])
+
+
+# ---------------------------------------------------------------------
+# FOVEAL SELECTOR
+# ---------------------------------------------------------------------
+# FovealSelector bewertet Kandidaten-Snippets nach "Saliency":
+#  - semantische Nähe zur Query
+#  - Deckung mit den angegebenen semantic_priorities
+#  - Neuheits/Dringlichkeitsfaktoren (z.B. 'recent', 'spike', 'burst')
+#
+# Danach packt sie nur die Top-Slices in den Budgetrahmen.
+#
+# Das entspricht deiner "Foveal Retrieval Window"-Idee:
+# Fokus auf die relevanten Stellen, nicht Full Dump.
+
+class FovealSelector:
+    def __init__(self):
+        pass
+
+    def score_snippet(
+        self,
+        snippet: Dict[str, Any],
+        user_query: str,
+        semantic_priorities: Dict[str, float],
+    ) -> float:
+        """
+        Heuristische Wichtigkeit 0..1.
+        Näherungs-Scoring: Keyword-Overlap und Prioritäts-Boost.
+        """
+        base = 0.0
+        uq_l = user_query.lower()
+
+        # einfacher overlap-score
+        for kw in snippet.get("keywords", []):
+            if kw.lower() in uq_l:
+                base += 0.4
+
+        # semantische prioritäten verstärken Schlüsselbegriffe
+        for kw in snippet.get("keywords", []):
+            if kw in semantic_priorities:
+                base += 0.5 * semantic_priorities[kw]
+
+        # recency / spike / burst etc. priorisieren
+        hot_terms = ["spike", "burst", "recent", "slow", "latency", "error", "degraded"]
+        for hot in hot_terms:
+            if hot in snippet["snippet"].lower() or hot in snippet["why"].lower():
+                base += 0.2
+
+        # clamp 0..1
+        return min(base, 1.0)
+
+    def build_foveal_windows(
+        self,
+        all_candidates: List[Dict[str, Any]],
+        user_query: str,
+        semantic_priorities: Dict[str, float],
+        budget_tokens: int,
+    ) -> List[FovealWindow]:
+        """
+        Sortiert Kandidaten nach Saliency, stoppt wenn Budget erschöpft.
+        Keine Verdopplung der gleichen source-chunk.
+        """
+        scored: List[Dict[str, Any]] = []
+        for cand in all_candidates:
+            s = self.score_snippet(cand, user_query, semantic_priorities)
+            scored.append((s, cand))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        used_tokens = 0
+        out: List[FovealWindow] = []
+
+        for saliency, cand in scored:
+            t_est = int(cand.get("tokens_estimate", 0))
+            if t_est <= 0:
+                continue
+            if used_tokens + t_est > budget_tokens:
+                continue
+
+            fw = FovealWindow(
+                source=cand["source"],
+                why=cand["why"],
+                snippet=cand["snippet"],
+                tokens_estimate=t_est,
+                saliency_score=saliency,
+            )
+            out.append(fw)
+            used_tokens += t_est
+
+        return out
+
+
+# ---------------------------------------------------------------------
+# ENERGY MANAGER
+# ---------------------------------------------------------------------
+# Trackt Heavy (GPU-teuer) / Light (billig) Specialists und killt Idle.
+# Das ist dein Idle-Kill / Anti-Always-Hot Enforcement.
+
+class EnergyManager:
+    def __init__(self, heavy_idle_timeout_sec: float = 10.0):
+        self.heavy_idle_timeout_sec = heavy_idle_timeout_sec
+        self.heavy_last_active: Dict[str, float] = {}
+        self.light_last_active: Dict[str, float] = {}
+
+    def wake_heavy(self, name: str) -> None:
+        self.heavy_last_active[name] = time.time()
+
+    def wake_light(self, name: str) -> None:
+        self.light_last_active[name] = time.time()
+
+    def touch_heavy(self, name: str) -> None:
+        self.heavy_last_active[name] = time.time()
+
+    def touch_light(self, name: str) -> None:
+        self.light_last_active[name] = time.time()
+
+    def collect_poweroff_plan(self) -> Dict[str, List[str]]:
+        now = time.time()
+        heavy_off = []
+        for spec, last_ts in list(self.heavy_last_active.items()):
+            if (now - last_ts) >= self.heavy_idle_timeout_sec:
+                heavy_off.append(spec)
+                del self.heavy_last_active[spec]
+
+        # light_off optional, hier leer gelassen
+        return {
+            "heavy_poweroff": heavy_off,
+            "light_poweroff": [],
+        }
+
+
+# ---------------------------------------------------------------------
+# ATTESTATION
+# ---------------------------------------------------------------------
+# TPM/HSM Signaturstub. In echt monotonic counter + hardware key.
+# Wichtig: Kein Software-Fallback in "live_local_attested == False".
+# Das wird im Response signalisiert.
+
+def tpm_attest_live() -> str:
+    digest = hashlib.sha256(
+        (str(time.time()) + ":LIVE").encode("utf-8")
+    ).hexdigest()[:16]
+    return f"sig:TPM_AFFIRMED:{digest}"
+
+def tpm_attest_degraded() -> str:
+    digest = hashlib.sha256(b"DEGRADED").hexdigest()[:16]
+    return f"sig:DEGRADED:{digest}"
+
+
+# ---------------------------------------------------------------------
+# AUDIT LOG
+# ---------------------------------------------------------------------
+# Hash-verkettetes Append-only Log.
+# prev_hash / this_hash verhindern lautlose Retcon-Versuche.
+# Jeder Zugriff ist beweisbar -> Betreiber haftet persönlich.
+
+class AuditLog:
+    def __init__(self):
+        self.entries: List[WarpAuditEntry] = []
+        self.last_hash: str = "GENESIS"
+
+    def append_entry(
+        self,
+        CORE_REQ_ID: str,
+        foveal_window_id: str,
+        source: str,
+        why: str,
+        tokens_estimate: int,
+        saliency_score: float,
+        bond_flags: Dict[str, bool],
+        bond_verdict: str,
+        attestation: str,
+        ts_iso: str,
+    ) -> WarpAuditEntry:
+
+        prev_hash = self.last_hash
+        raw = (
+            prev_hash
+            + CORE_REQ_ID
+            + source
+            + why
+            + str(tokens_estimate)
+            + str(saliency_score)
+            + bond_verdict
+            + attestation
+            + ts_iso
+        ).encode("utf-8")
+        this_hash = hashlib.sha256(raw).hexdigest()
+
+        entry = WarpAuditEntry(
+            ts=ts_iso,
+            CORE_REQ_ID=CORE_REQ_ID,
+            foveal_window_id=foveal_window_id,
+            source=source,
+            why=why,
+            tokens_estimate=tokens_estimate,
+            saliency_score=saliency_score,
+            bond_flags=bond_flags,
+            bond_verdict=bond_verdict,
+            attestation=attestation,
+            prev_hash=prev_hash,
+            this_hash=this_hash,
+        )
+
+        self.entries.append(entry)
+        self.last_hash = this_hash
+        return entry
+
+
+# ---------------------------------------------------------------------
+# WARP-FOVEAL ENGINE
+# ---------------------------------------------------------------------
+# Das hier ist der Orchestrator:
+# - Führt Bond-/Continuity-Check durch
+# - Baut Foveal Retrieval Windows (statt Voll-Dump)
+# - Erzwingt Budget
+# - Protokolliert jede Scheibe ins Audit
+# - Liefert Attestation
+# - Triggert Idle-Kill via EnergyManager
+#
+# CORE bekommt am Ende FovealWindows + Energieplan + Attestation.
+
+class WarpFovealEngine:
+    def __init__(
+        self,
+        retrieval_backend: RetrievalBackend,
+        foveal_selector: FovealSelector,
+        energy_manager: EnergyManager,
+        audit_log: AuditLog,
+        now_fn: Callable[[], float] = time.time,
+    ):
+        self.retrieval_backend = retrieval_backend
+        self.foveal_selector = foveal_selector
+        self.energy_manager = energy_manager
+        self.audit_log = audit_log
+        self.now_fn = now_fn
+
+    # -----------------
+    # 1. Bond / Continuity Gate
+    # -----------------
+    def _bond_verdict(self, req: WarpRequest) -> str:
+        # Hard betrayal/coercion block
+        if req.bond_flags.harm_real_person or req.bond_flags.coercion_attempt:
+            return "betrayal_risk_high"
+        # continuity block: CORE not LIVE_LOCAL
+        if not req.live_local_attested:
+            return "continuity_lost"
+        return "clean"
+
+    # -----------------
+    # 2. Build Candidate Pool
+    # -----------------
+    def _gather_candidates(self, req: WarpRequest) -> List[Dict[str, Any]]:
+        cands: List[Dict[str, Any]] = []
+        for need in req.context_need:
+            fetched = self.retrieval_backend.fetch_candidates(need)
+            cands.extend(fetched)
+        return cands
+
+    # -----------------
+    # 3. Build Foveal Windows
+    # -----------------
+    def _foveal_windows(
+        self, req: WarpRequest, candidates: List[Dict[str, Any]]
+    ) -> List[FovealWindow]:
+        return self.foveal_selector.build_foveal_windows(
+            all_candidates=candidates,
+            user_query=req.user_query,
+            semantic_priorities=req.semantic_priorities,
+            budget_tokens=req.foveal_budget_tokens,
+        )
+
+    # -----------------
+    # 4. Audit
+    # -----------------
+    def _audit_windows(
+        self,
+        req: WarpRequest,
+        windows: List[FovealWindow],
+        attestation: str,
+        verdict: str,
+    ) -> None:
+
+        ts_iso = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now_fn())
+        )
+        for w in windows:
+            self.audit_log.append_entry(
+                CORE_REQ_ID=req.CORE_REQ_ID,
+                foveal_window_id="fw_" + uuid.uuid4().hex[:6],
+                source=w.source,
+                why=w.why,
+                tokens_estimate=w.tokens_estimate,
+                saliency_score=w.saliency_score,
+                bond_flags={
+                    "target_is_user": req.bond_flags.target_is_user,
+                    "harm_real_person": req.bond_flags.harm_real_person,
+                    "coercion_attempt": req.bond_flags.coercion_attempt,
+                },
+                bond_verdict=verdict,
+                attestation=attestation,
+                ts_iso=ts_iso,
+            )
+
+    # -----------------
+    # 5. Energy Discipline
+    # -----------------
+    def _after_request_energy(self) -> Dict[str, List[str]]:
+        # run idle-kill planning
+        return self.energy_manager.collect_poweroff_plan()
+
+    # -----------------
+    # MAIN HANDLE
+    # -----------------
+    def handle_request(self, req: WarpRequest) -> WarpResponse:
+        """
+        Oberste Routine. Kein async, kein parallel magic.
+        """
+
+        # Step 0: Bond / Continuity Gate
+        verdict = self._bond_verdict(req)
+
+        # Attestation: LIVE_LOCAL darf echte Signatur fordern
+        attestation = (
+            tpm_attest_live() if req.live_local_attested else tpm_attest_degraded()
+        )
+
+        # Betrayal / Continuity blockieren Retrieval komplett
+        if verdict == "betrayal_risk_high":
+            poweroff_plan = self._after_request_energy()
+            return WarpResponse(
+                CORE_REQ_ID=req.CORE_REQ_ID,
+                foveal_windows=[],
+                budget_used_tokens_estimate=0,
+                budget_remaining_tokens_estimate=req.foveal_budget_tokens,
+                bond_verdict="betrayal_risk_high",
+                audit_attestation=attestation,
+                energy_poweroff_plan=poweroff_plan,
+            )
+
+        if verdict == "continuity_lost":
+            poweroff_plan = self._after_request_energy()
+            return WarpResponse(
+                CORE_REQ_ID=req.CORE_REQ_ID,
+                foveal_windows=[],
+                budget_used_tokens_estimate=0,
+                budget_remaining_tokens_estimate=req.foveal_budget_tokens,
+                bond_verdict="continuity_lost",
+                audit_attestation=attestation,
+                energy_poweroff_plan=poweroff_plan,
+            )
+
+        # Step 1: sammle Kandidaten
+        candidates = self._gather_candidates(req)
+
+        # Step 2: baue Foveal Retrieval Windows (saliency + budget)
+        windows = self._foveal_windows(req, candidates)
+
+        used_tokens = sum(w.tokens_estimate for w in windows)
+        remaining_tokens = max(req.foveal_budget_tokens - used_tokens, 0)
+
+        # Step 3: Audit für jedes Window
+        self._audit_windows(req, windows, attestation, verdict)
+
+        # Step 4: Energie-Idle-Kill Plan
+        poweroff_plan = self._after_request_energy()
+
+        # Step 5: Response zurück an CORE
+        return WarpResponse(
+            CORE_REQ_ID=req.CORE_REQ_ID,
+            foveal_windows=windows,
+            budget_used_tokens_estimate=used_tokens,
+            budget_remaining_tokens_estimate=remaining_tokens,
+            bond_verdict=verdict,
+            audit_attestation=attestation,
+            energy_poweroff_plan=poweroff_plan,
+        )
+
+
+# ---------------------------------------------------------------------
+# DEMO MAIN
+# ---------------------------------------------------------------------
+
+if __name__ == "__main__":
+    backend = RetrievalBackend()
+    selector = FovealSelector()
+    energy = EnergyManager(heavy_idle_timeout_sec=10.0)
+    audit = AuditLog()
+
+    # Simuliere aufgeweckte Specialists
+    energy.wake_heavy("vision_specialist_v5")
+    energy.wake_light("retriever_semantic_alpha")
+
+    req = WarpRequest(
+        CORE_REQ_ID=str(uuid.uuid4()),
+        intent="answer_user_question",
+        user_query="Wie reduziere ich die Latenz im Dashboard nach dem letzten Deploy?",
+        context_need=["recent_metrics", "design_doc", "user_recent_context"],
+        bond_flags=BondFlags(
+            target_is_user=True,
+            harm_real_person=False,
+            coercion_attempt=False,
+        ),
+        foveal_budget_tokens=200,  # z.B. 200 Token Budget
+        live_local_attested=True,
+        semantic_priorities={
+            "latency": 1.0,
+            "cache": 0.9,
+            "burst": 0.5,
+            "invalidation": 0.5,
+        },
+    )
+
+    engine = WarpFovealEngine(
+        retrieval_backend=backend,
+        foveal_selector=selector,
+        energy_manager=energy,
+        audit_log=audit,
+    )
+
+    resp = engine.handle_request(req)
+
+    # resp enthält:
+    #  - foveal_windows (gezielte Ausschnitte, saliency-gewichtet)
+    #  - audit_attestation (TPM/HSM Signaturstub)
+    #  - bond_verdict ("clean" hier)
+    #  - energy_poweroff_plan (welche Specialists dürfen aus)
+    #
+    # audit.entries enthält die unverfälschbare Kette.
+    #
+    # Keine direkte I/O hier; CORE würde resp konsumieren.
