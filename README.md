@@ -1,4 +1,5 @@
 #Keisho-Waza Codex
+https://hand-made24.de/der-kodex-jur.html
 
 1. What is the Codex? 
 
