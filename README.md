@@ -1,4 +1,4 @@
-#Keish-Waza Codex
+#Keisho-Waza Codex
 
 1. What is the Codex? 
 
